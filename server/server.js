@@ -1,75 +1,83 @@
 import express from 'express'
-import path from 'path';
-import logger from 'morgan';
-import { fileURLToPath } from 'url';
-import { createServer } from 'node:http'
-import { Server } from 'socket.io'
+import logger from 'morgan'
 import dotenv from 'dotenv'
-import sqlite3 from 'sqlite3';
+import { createClient } from '@libsql/client'
+import path from 'path'
+import { Server } from 'socket.io'
+import { createServer } from 'node:http'
+import { fileURLToPath } from 'node:url'
 
+dotenv.config()
 
-
-
-
-
-
-
- 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const port = process.env.PORT ?? 3000;
-const app = express();
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '../client/index.html'));
-});
-
+const port = process.env.PORT ?? 3000
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const app = express()
 const server = createServer(app)
+const io = new Server(server, {
+  connectionStateRecovery: {}
+})
 
-server.listen(port, () => {
-    console.log(`Started at ${port}`);
-  });
+const db = createClient({
+  url: 'libsql://informed-barracuda-juansep1231.turso.io',
+  authToken: process.env.DB_TOKEN
+})
 
-  const io = new Server(server, {
-    connectionStateRecovery: {}
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT,
+    user TEXT
+  )
+`)
+
+io.on('connection', async (socket) => {
+  console.log('a user has connected!')
+
+  socket.on('disconnect', () => {
+    console.log('an user has disconnected')
   })
 
-  
-  
-  dotenv.config();
-  
-  // Specify the SQLite database file path
-  const dbFilePath = './database.db';
-  
-  // Create a new SQLite database connection
-  const db = new sqlite3.Database(dbFilePath,sqlite3.OPEN_READWRITE, (err) => {if (err) {console.error(err.message);}});
-  
-  //Create table
-  const sql = `CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content TEXT
-  )`;
-  
-  db.run(sql);
-
-
-io.on('connection', (socket) => {
   socket.on('chat message', async (msg) => {
-    let result;
+    let result
+    const username = socket.handshake.auth.username ?? 'anonymous'
+    console.log({ username })
     try {
-      console.log(msg)
-    
       result = await db.execute({
-        sql: `INSERT INTO messages (content) VALUES (:content)`,
-        args: { content: msg }
-      });
+        sql: 'INSERT INTO messages (content, user) VALUES (:msg, :username)',
+        args: { msg, username }
+      })
     } catch (e) {
       console.error(e)
       return
     }
-  
-    io.emit('chat message', msg, result.lastInsertRowid.toString())
+
+    io.emit('chat message', msg, result.lastInsertRowid.toString(), username)
   })
-  
-  })
-  
-  
+
+  if (!socket.recovered) { // <- recuperase los mensajes sin conexión
+    try {
+      const results = await db.execute({
+        sql: 'SELECT id, content, user FROM messages WHERE id > ?',
+        args: [socket.handshake.auth.serverOffset ?? 0]
+      })
+
+      results.rows.forEach(row => {
+        socket.emit('chat message', row.content, row.id.toString(), row.user)
+      })
+    } catch (e) {
+      console.error(e)
+    }
+  }
+})
+
+app.use(logger('dev'))
+
+app.get('/', (req, res) => { 
+
+  res.sendFile(path.join(__dirname, '../client/index.html')); 
+
+});
+server.listen(port, () => {
+  console.log(`Server running on port ${port}`)
+})
